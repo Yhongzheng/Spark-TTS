@@ -483,3 +483,6 @@ async def synthesize_txt(
         num_workers=num_workers,
         results=[SynthesisResult(**{k: v for k, v in r.items() if k in SynthesisResult.__fields__}) for r in results],
     )
+
+if __name__ == '__main__':
+    bash = 'uvicorn app_fastapi_tts:app --host 0.0.0.0 --port 8000 --reload'
