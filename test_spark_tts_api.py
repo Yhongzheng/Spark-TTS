@@ -52,7 +52,7 @@ from requests.adapters import HTTPAdapter
 
 
 # ================== 基本配置（按需修改） ==================
-BASE_URL: str = "http://127.0.0.1:8000"
+BASE_URL: str = "http://127.0.0.1:8001"
 API_KEY: Optional[str] = None            # 若服务端设置了 API_KEY，这里填同样的值，否则留空
 MODEL_PATH: Optional[str] = None         # 不填用服务默认模型；也可指定绝对路径
 OUTPUT_DIR: Optional[str] = None         # 不填用服务默认 outputs/
@@ -71,18 +71,18 @@ DEFAULT_TIMEOUT: int = 600
 # 是否在成功后列出输出目录的新文件（需要服务端返回 used_output_dir）
 LIST_NEW_FILES: bool = True
 # =========================================================
-
-
 def _build_session() -> requests.Session:
     """
-    构建带自动重试的 Session：
-    - 对连接错误、部分 5xx 做指数退避重试
-    - 避免偶发网络抖动导致的假失败
+    带自动重试的 Session：
+    - 连接错误/部分 5xx 可重试
+    - 读超时不重试（避免重复触发重任务）
     """
     session = requests.Session()
     retry = Retry(
-        total=3,                 # 总重试次数
-        backoff_factor=0.6,      # 退避因子（指数退避：0.6, 1.2, 2.4 ...）
+        total=3,
+        connect=3,            # 连接类错误可重试
+        read=0,               # 🔑 读超时不重试
+        backoff_factor=0.6,   # 指数退避
         status_forcelist=(500, 502, 503, 504),
         allowed_methods=frozenset(["GET", "POST"]),
         raise_on_status=False,
@@ -173,7 +173,7 @@ def _snapshot_dir(path_str: Optional[str]) -> set:
 def healthz() -> Dict[str, Any]:
     """调用 /healthz，返回 JSON。"""
     url = f"{BASE_URL}/healthz"
-    r = SESSION.get(url, headers=_headers_form(), timeout=30)
+    r = SESSION.get(url, headers=_headers_form(), timeout=DEFAULT_TIMEOUT)
     r.raise_for_status()
     data = r.json()
     _pretty("healthz", data)
@@ -220,6 +220,95 @@ def synthesize_virtual(texts: List[str]) -> Dict[str, Any]:
         used_output_dir = data.get("used_output_dir")
         after = _snapshot_dir(used_output_dir)
         _list_new_wavs(used_output_dir, before, after)
+    return data
+
+def normalize_preview(
+    texts,                           # List[str] | str(单句) | str(文件路径) | Path
+    english_mode: Optional[str] = None,  # 不传则让服务端沿用默认，避免额外构造
+    normalize: bool = True,          # 是否启用规范化
+    *,
+    filename_from_txt: bool = True,  # 预览 TXT 时：是否启用 "文件名|文本" 拆分
+    sep: str = "|",                  # 文件名与文本的分隔符
+    max_lines: int = 50,             # 🔑 首测限制 50 行，避免一次性太大
+) -> Dict[str, Any]:
+    """
+    一体化预览：
+    - 自动识别单句/文件/列表
+    - 默认不传 english_mode，以复用服务端默认 normalizer
+    """
+    import os
+    import pathlib
+
+    # 规范成字符串列表
+    text_list: List[str] = []
+    if isinstance(texts, (str, pathlib.Path)):
+        p = pathlib.Path(texts)
+        if p.exists() and p.is_file():
+            raw = p.read_text(encoding="utf-8", errors="replace").splitlines()
+            for line in raw:
+                s = line.strip()
+                if not s or s.startswith("#"):
+                    continue
+                if filename_from_txt and (sep in s):
+                    _, t = s.split(sep, 1)
+                    t = t.strip()
+                    if t:
+                        text_list.append(t)
+                else:
+                    text_list.append(s)
+        else:
+            text_list = [str(texts)]
+    elif isinstance(texts, list):
+        if len(texts) == 1 and isinstance(texts[0], str):
+            p = pathlib.Path(texts[0])
+            if p.exists() and p.is_file():
+                return normalize_preview(
+                    texts[0],
+                    english_mode=english_mode,
+                    normalize=normalize,
+                    filename_from_txt=filename_from_txt,
+                    sep=sep,
+                    max_lines=max_lines,
+                )
+        text_list = [str(x).strip() for x in texts if str(x).strip()]
+    else:
+        raise TypeError("texts 必须是 List[str]、str 或 Path")
+
+    if len(text_list) > max_lines:
+        print(f"[preview] 文本行数 {len(text_list)} > max_lines={max_lines}，仅预览前 {max_lines} 行。")
+        text_list = text_list[:max_lines]
+
+    # 请求
+    url = f"{BASE_URL}/text/normalize_preview"
+    payload: Dict[str, Any] = {
+        "texts": text_list,
+        "normalize": normalize,
+    }
+    if english_mode is not None:
+        payload["english_mode"] = english_mode
+
+    r = SESSION.post(url, headers=_headers_json(), data=json.dumps(payload), timeout=DEFAULT_TIMEOUT)  # 🔑 600s
+    r.raise_for_status()
+    data = r.json()
+
+    # 友好打印
+    print("\n=== normalize_preview ===")
+    if isinstance(data, dict) and "items" in data and isinstance(data["items"], list):
+        mode = data.get("english_mode_used", english_mode)
+        print(f"english_mode_used: {mode}")
+        for i, it in enumerate(data["items"], 1):
+            orig = it.get("original", "")
+            norm = it.get("normalized", "")
+            print(f"[{i:03d}] 原: {orig}")
+            print(f"      归: {norm}")
+    elif isinstance(data, dict) and "normalized" in data:
+        norms = data.get("normalized") or []
+        for i, (orig, norm) in enumerate(zip(text_list, norms), 1):
+            print(f"[{i:03d}] 原: {orig}")
+            print(f"      归: {norm}")
+    else:
+        print(data)
+
     return data
 
 
@@ -340,32 +429,31 @@ def synthesize_txt_upload(txt_path: Optional[str] = None, filename_from_txt: boo
         _list_new_wavs(used_output_dir, before, after)
     return resp
 
-
 def main() -> None:
-    """主流程：健康检查 → 虚拟音色 → 并行演示 → TXT 批量 → （可选）语音克隆。"""
+    """主流程：健康检查 → 规范化预览 → TXT 批量 → （可选）语音克隆。"""
     print("开始测试 Spark-TTS FastAPI 服务...")
     t0 = time.time()
 
     # 1) 健康检查
     hz = healthz()
 
-    # 2) 最小 JSON（虚拟音色）
-    synthesize_virtual([
-        "今天16:30开会，增长12.5%，报名费￥199。",
+    # 2) 规范化预览（默认不传 english_mode，走服务端默认并复用缓存）
+    normalize_preview([
+        "iPhone 15 Pro 将在 2025年8月21日 16:30 发布。",
         "ID 10086 不要改读法。"
     ])
+    if TXT_FILE:
+        normalize_preview(TXT_FILE)
 
-    # 3) 并行度演示（CPU 可适当尝试 2~3；GPU 通常保持 1）
-    synthesize_parallel(["a", "b", "c"], num_workers=3, allow_parallel_on_gpu=None)
-
-    # 4) TXT 批量
+    # 3) TXT 批量
     synthesize_txt_upload(TXT_FILE, filename_from_txt=True, sep="|")
 
-    # 5) （可选）语音克隆
+    # 4) （可选）语音克隆
     if PROMPT_WAV:
         synthesize_clone(["你好，这是克隆测试。"], prompt_wav=PROMPT_WAV, prompt_text="这里填参考音频的转写")
 
     print(f"\n全部完成，用时：{time.time() - t0:.1f}s")
+
 
 
 if __name__ == "__main__":

@@ -74,6 +74,9 @@ from pydantic import BaseModel, Field
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from text_frontend.normalizer import TextNormalizer
+import logging
+
+logger = logging.getLogger("sparktts.app")
 
 
 # ======================== 配置区域（可用环境变量覆盖） ========================
@@ -100,6 +103,27 @@ API_KEY = os.environ.get("API_KEY", "")
 LEXICON_PATH = REPO_ROOT / "text_frontend" / "lexicon.yaml"
 TEXT_NORMALIZER = TextNormalizer(LEXICON_PATH)
 # ======================== 工具函数 ========================
+def get_normalizer(mode: Optional[str]):
+    """
+    (mode -> TextNormalizer) 简单缓存，避免反复构造；
+    mode 取值：keep/spell/auto/None（None 等同 'auto'）
+    """
+    from text_frontend.normalizer import TextNormalizer
+    import threading
+
+    if not hasattr(get_normalizer, "_cache"):
+        get_normalizer._cache = {}   # type: ignore[attr-defined]
+        get_normalizer._lock = threading.RLock()  # type: ignore[attr-defined]
+
+    m = mode if mode in {"keep", "spell", "auto"} else "auto"
+
+    with getattr(get_normalizer, "_lock"):  # type: ignore[attr-defined]
+        cached = getattr(get_normalizer, "_cache").get(m)  # type: ignore[attr-defined]
+        if cached is not None:
+            return cached
+        n = TextNormalizer(LEXICON_PATH, english_mode=m)
+        getattr(get_normalizer, "_cache")[m] = n  # type: ignore[attr-defined]
+        return n
 
 def pick_device_arg() -> List[str]:
     """
@@ -220,11 +244,12 @@ class SynthesisRequest(BaseModel):
     - model_path：可选；不传则使用服务默认模型目录
     - output_dir：可选；不传则输出到服务默认 outputs/
     - num_workers：并行度（默认 1；GPU 上默认强制改为 1，除非允许 GPU 并行）
+    - english_mode：英文处理模式（keep/spell/auto），默认 auto
     """
     texts: List[SynthesisItem] = Field(default_factory=list, description="要合成的文本列表")
 
-    # ⬇️ 批量级规范化总开关（默认 True），调用端已在发这个字段
     normalize_text: bool = Field(default=True, description="是否对文本做中文化规范化（全局）；可被单条覆盖")
+    english_mode: Literal["keep", "spell", "auto"] = Field(default="auto", description="英文处理模式")
 
     output_dir: Optional[str] = Field(default=None, description="输出目录（不传则为服务默认 outputs/）")
     model_path: Optional[str] = Field(default=None, description="模型目录（不传则为默认 pretrained_models/Spark-TTS-0.5B）")
@@ -242,9 +267,10 @@ class SynthesisRequest(BaseModel):
     num_workers: int = Field(default=1, ge=1, le=16, description="并行度（默认 1）")
     allow_parallel_on_gpu: Optional[bool] = Field(default=None, description="是否允许在 GPU 上并行（默认遵循服务全局设置）")
 
-    # 仅 /synthesize_txt 用到的解析开关（这里放在 JSON 里是为了保持接口对齐；/synthesize 会忽略）
+    # 仅 /synthesize_txt 用到的解析开关（保持接口对齐；/synthesize 会忽略）
     filename_from_txt: bool = Field(default=False, description="TXT 解析：是否使用“文件名|文本”")
     txt_separator: str = Field(default="|", description="TXT 解析：文件名与文本的分隔符")
+
 
 
 class SynthesisResult(BaseModel):
@@ -320,35 +346,99 @@ def healthz():
 
 @app.post("/text/normalize_preview")
 def normalize_preview(
-    texts: List[str] = Body(..., embed=True, description="要预览规范化的文本列表"),
-    normalize: bool = Body(True, description="是否启用规范化（调试时可关）"),
+    body: Dict[str, Any] = Body(
+        ...,
+        example={
+            "texts": ["iPhone 15 Pro 将在 2025年8月21日 16:30 发布。", "ID 10086 不要改读法。"],
+            "normalize": True,
+            "english_mode": "auto"  # keep / spell / auto
+        },
+        description="调试文本规范化：支持 english_mode"
+    ),
     x_api_key: Optional[str] = Header(default=None),
 ):
     _check_api_key(x_api_key)
-    out = []
+
+    texts: List[str] = body.get("texts", [])
+    if not isinstance(texts, list):
+        raise HTTPException(status_code=400, detail="texts 必须是字符串列表")
+
+    normalize_flag: bool = bool(body.get("normalize", True))
+    english_mode: Optional[str] = body.get("english_mode", "auto")
+
+    norm = get_normalizer(english_mode)
+    english_mode_used = getattr(norm, "english_mode", "auto")
+
+    items = []
     for t in texts:
-        out.append(TEXT_NORMALIZER.normalize(t) if normalize else t)
-    return {"normalized": out}
+        s = str(t)
+        normed = norm.normalize(s) if normalize_flag else s
+
+        # 扫描词典命中，帮助判断英文是否被强制改读
+        hits_keep, hits_force = [], []
+        try:
+            lex = norm.lex
+            src = s
+            hits_keep = [k for k in (lex.keep_english or []) if k and k in src]
+            hits_force = [k for k in (lex.force_zh or {}).keys() if k and k in src]
+        except Exception:
+            pass
+
+        items.append({
+            "original": s,
+            "normalized": normed,
+            "lexicon_hits": {"keep_english": hits_keep, "force_zh": hits_force}
+        })
+
+    try:
+        logger.info("normalize_preview count=%d mode=%s", len(items), english_mode_used)
+    except Exception:
+        pass
+
+    return {
+        "normalized": [it["normalized"] for it in items],
+        "english_mode_used": english_mode_used,
+        "items": items
+    }
+
 
 @app.post("/lexicon/reload")
 def lexicon_reload(x_api_key: Optional[str] = Header(default=None)):
     _check_api_key(x_api_key)
+    from text_frontend.normalizer import TextNormalizer
+
     global TEXT_NORMALIZER
-    TEXT_NORMALIZER = TextNormalizer(LEXICON_PATH)
+    TEXT_NORMALIZER = TextNormalizer(LEXICON_PATH, english_mode="auto")
+
+    # 清理 get_normalizer 缓存
+    try:
+        if hasattr(get_normalizer, "_cache"):
+            get_normalizer._cache.clear()  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
     try:
         mtime = os.path.getmtime(LEXICON_PATH)
     except Exception:
         mtime = None
     return {"status": "reloaded", "lexicon_path": str(LEXICON_PATH), "lexicon_mtime": mtime}
 
+
+@app.on_event("startup")
+def app_startup_warmup():
+    """进程启动预热，降低首请求时延。"""
+    try:
+        for m in ("auto", "keep", "spell"):
+            n = get_normalizer(m)
+            _ = n.normalize("预热 123，在 2025年8月21日 16:30 发布。ID 10086。")
+        logger.info("Spark-TTS normalizer warmup done.")
+    except Exception as e:
+        logger.warning("Spark-TTS normalizer warmup skipped: %r", e)
+
+
+
 @app.post("/synthesize", response_model=SynthesisResponse)
 def synthesize(req: SynthesisRequest, x_api_key: Optional[str] = Header(default=None)):
-    """
-    通过 JSON 发起合成：
-    - texts：至少一条
-    - 有参考音频：传 prompt_speech_path（服务器可读），可选 prompt_text
-    - 无参考音频：提供 gender/pitch/speed
-    """
     _check_api_key(x_api_key)
 
     if not req.texts:
@@ -376,15 +466,17 @@ def synthesize(req: SynthesisRequest, x_api_key: Optional[str] = Header(default=
     allow_parallel = req.allow_parallel_on_gpu if req.allow_parallel_on_gpu is not None else ALLOW_PARALLEL_ON_GPU
     num_workers = req.num_workers
     if gpu_in_use and not allow_parallel and num_workers > 1:
-        # GPU 上默认强制单并发，避免显存争用/性能反而下降
         num_workers = 1
+
+    # 选定 normalizer（按 english_mode 缓存复用）
+    norm = get_normalizer(req.english_mode)
 
     # 组装任务
     jobs: List[Tuple[List[str], Path, str]] = []
     for i, item in enumerate(req.texts, 1):
         name = f"text_{i:03d}"
         use_norm = item.normalize if item.normalize is not None else req.normalize_text
-        text = TEXT_NORMALIZER.normalize(item.text) if use_norm else item.text
+        text = norm.normalize(item.text) if use_norm else item.text
         argv = build_cli_argv(
             text=text,
             model_path=model_p,
@@ -429,6 +521,7 @@ def synthesize(req: SynthesisRequest, x_api_key: Optional[str] = Header(default=
     )
 
 
+
 @app.post("/synthesize_txt", response_model=SynthesisResponse)
 async def synthesize_txt(
     file: UploadFile = File(..., description="UTF-8 文本文件；每行一条；或 '文件名|文本'"),
@@ -446,15 +539,11 @@ async def synthesize_txt(
     # 并行
     num_workers: int = Form(default=1),
     allow_parallel_on_gpu: Optional[bool] = Form(default=None),
-    # 批量级规范化开关（表单）
+    # 规范化
     normalize_text: bool = Form(default=True),
+    english_mode: Literal["keep", "spell", "auto"] = Form(default="auto"),
     x_api_key: Optional[str] = Header(default=None),
 ):
-    """
-    通过上传 TXT 发起批量合成：
-    - txt 每行一条；或 filename_from_txt=True 使用“文件名|文本”
-    - 其他参数含义与 /synthesize 一致
-    """
     _check_api_key(x_api_key)
 
     content = (await file.read()).decode("utf-8", errors="replace")
@@ -481,9 +570,12 @@ async def synthesize_txt(
     if gpu_in_use and not allow_parallel and num_workers > 1:
         num_workers = 1
 
+    # 选定 normalizer（按 english_mode 缓存复用）
+    norm = get_normalizer(english_mode)
+
     jobs: List[Tuple[List[str], Path, str]] = []
     for name, text in tasks:
-        txt = TEXT_NORMALIZER.normalize(text) if normalize_text else text
+        txt = norm.normalize(text) if normalize_text else text
         argv = build_cli_argv(
             text=txt,
             model_path=model_p,
@@ -527,4 +619,8 @@ async def synthesize_txt(
     )
 
 if __name__ == '__main__':
-    bash = 'uvicorn app_fastapi_tts:app --host 0.0.0.0 --port 8000 --reload'
+    bash = 'uvicorn app_fastapi_tts:app --host 0.0.0.0 --port 8001 --reload'
+    """ 关闭 8000、8001 端口，有时候不知道为什么一直占用，现阶段先不研究这么细了
+for /f "tokens=5" %p in ('netstat -ano ^| findstr ":8000" ^| findstr "LISTENING"') do taskkill /F /PID %p >nul 2>&1
+for /f "tokens=5" %p in ('netstat -ano ^| findstr ":8001" ^| findstr "LISTENING"') do taskkill /F /PID %p >nul 2>&1
+    """
