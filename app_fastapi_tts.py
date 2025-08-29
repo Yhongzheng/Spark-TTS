@@ -68,10 +68,12 @@ import subprocess
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Any, Literal
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header, Body
 from fastapi.responses import JSONResponse, RedirectResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 from concurrent.futures import ProcessPoolExecutor, as_completed
+
+from text_frontend.normalizer import TextNormalizer
 
 
 # ======================== 配置区域（可用环境变量覆盖） ========================
@@ -94,7 +96,9 @@ ALLOW_PARALLEL_ON_GPU = os.environ.get("SPARK_TTS_ALLOW_PARALLEL_ON_GPU", "0") =
 # 可选简易鉴权：设置 API_KEY 后，调用方需在请求头携带 X-API-Key
 API_KEY = os.environ.get("API_KEY", "")
 
-
+# 词库
+LEXICON_PATH = REPO_ROOT / "text_frontend" / "lexicon.yaml"
+TEXT_NORMALIZER = TextNormalizer(LEXICON_PATH)
 # ======================== 工具函数 ========================
 
 def pick_device_arg() -> List[str]:
@@ -203,6 +207,8 @@ def parse_txt_lines(
 class SynthesisItem(BaseModel):
     """单条文本的合成输入"""
     text: str = Field(..., description="要合成的文本")
+    # 单条级开关：None 表示继承批量级 normalize_text；True/False 显式覆盖
+    normalize: Optional[bool] = Field(default=None, description="是否对该条文本做规范化；未传则继承批量设置")
 
 
 class SynthesisRequest(BaseModel):
@@ -216,6 +222,10 @@ class SynthesisRequest(BaseModel):
     - num_workers：并行度（默认 1；GPU 上默认强制改为 1，除非允许 GPU 并行）
     """
     texts: List[SynthesisItem] = Field(default_factory=list, description="要合成的文本列表")
+
+    # ⬇️ 批量级规范化总开关（默认 True），调用端已在发这个字段
+    normalize_text: bool = Field(default=True, description="是否对文本做中文化规范化（全局）；可被单条覆盖")
+
     output_dir: Optional[str] = Field(default=None, description="输出目录（不传则为服务默认 outputs/）")
     model_path: Optional[str] = Field(default=None, description="模型目录（不传则为默认 pretrained_models/Spark-TTS-0.5B）")
 
@@ -291,18 +301,45 @@ def favicon():
 
 @app.get("/healthz")
 def healthz():
-    """
-    健康检查端点：
-    - 返回服务关键路径与可用性信息
-    """
+    lex_path = str(LEXICON_PATH)
+    try:
+        mtime = os.path.getmtime(LEXICON_PATH)
+    except Exception:
+        mtime = None
     return {
         "status": "ok",
         "repo_root": str(REPO_ROOT),
         "default_model_path": str(DEFAULT_MODEL_DIR),
         "default_output_dir": str(DEFAULT_OUTPUT_DIR),
         "allow_parallel_on_gpu": ALLOW_PARALLEL_ON_GPU,
+        # 新增：词典状态
+        "lexicon_path": lex_path,
+        "lexicon_mtime": mtime,
     }
 
+
+@app.post("/text/normalize_preview")
+def normalize_preview(
+    texts: List[str] = Body(..., embed=True, description="要预览规范化的文本列表"),
+    normalize: bool = Body(True, description="是否启用规范化（调试时可关）"),
+    x_api_key: Optional[str] = Header(default=None),
+):
+    _check_api_key(x_api_key)
+    out = []
+    for t in texts:
+        out.append(TEXT_NORMALIZER.normalize(t) if normalize else t)
+    return {"normalized": out}
+
+@app.post("/lexicon/reload")
+def lexicon_reload(x_api_key: Optional[str] = Header(default=None)):
+    _check_api_key(x_api_key)
+    global TEXT_NORMALIZER
+    TEXT_NORMALIZER = TextNormalizer(LEXICON_PATH)
+    try:
+        mtime = os.path.getmtime(LEXICON_PATH)
+    except Exception:
+        mtime = None
+    return {"status": "reloaded", "lexicon_path": str(LEXICON_PATH), "lexicon_mtime": mtime}
 
 @app.post("/synthesize", response_model=SynthesisResponse)
 def synthesize(req: SynthesisRequest, x_api_key: Optional[str] = Header(default=None)):
@@ -346,8 +383,10 @@ def synthesize(req: SynthesisRequest, x_api_key: Optional[str] = Header(default=
     jobs: List[Tuple[List[str], Path, str]] = []
     for i, item in enumerate(req.texts, 1):
         name = f"text_{i:03d}"
+        use_norm = item.normalize if item.normalize is not None else req.normalize_text
+        text = TEXT_NORMALIZER.normalize(item.text) if use_norm else item.text
         argv = build_cli_argv(
-            text=item.text,
+            text=text,
             model_path=model_p,
             output_dir=output_p,
             use_clone=use_clone,
@@ -407,6 +446,8 @@ async def synthesize_txt(
     # 并行
     num_workers: int = Form(default=1),
     allow_parallel_on_gpu: Optional[bool] = Form(default=None),
+    # 批量级规范化开关（表单）
+    normalize_text: bool = Form(default=True),
     x_api_key: Optional[str] = Header(default=None),
 ):
     """
@@ -442,8 +483,9 @@ async def synthesize_txt(
 
     jobs: List[Tuple[List[str], Path, str]] = []
     for name, text in tasks:
+        txt = TEXT_NORMALIZER.normalize(text) if normalize_text else text
         argv = build_cli_argv(
-            text=text,
+            text=txt,
             model_path=model_p,
             output_dir=output_p,
             use_clone=use_clone,

@@ -1,0 +1,16 @@
+# 哪些词必须保留英文原样（不做中文化，也不改读法）
+keep_english:
+  - "iPhone 15 Pro"
+  - "OpenAI"
+  - "Apple Vision Pro"
+  - "Model X"
+
+# 哪些词必须中文化/固定读法（覆盖规则）
+force_zh:
+  "AIGC": "A I G C"          # 或者 "人工智能生成内容"
+  "GPT-4o": "G P T 四 O"
+
+# 多音字（预留；若以后接入 g2pM/g2pw，可在 G2P 阶段使用）
+pinyin_override:
+  "重阳": "chong2 yang2"
+  "重庆": "chong2 qing4"
