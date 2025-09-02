@@ -724,7 +724,8 @@ async def synthesize_txt(
     )
 
 if __name__ == '__main__':
-    bash = 'uvicorn app_fastapi_tts:app --host 0.0.0.0 --port 8001 --reload'
+    bash = 'uvicorn app_fastapi_tts:app --host 0.0.0.0 --port 8000 --reload'
+    # bash = 'uvicorn app_fastapi_tts:app --host 0.0.0.0 --port 8001 --reload'
     """ 关闭 8000、8001 端口，有时候不知道为什么一直占用，现阶段先不研究这么细了
 for /f "tokens=5" %p in ('netstat -ano ^| findstr ":8000" ^| findstr "LISTENING"') do taskkill /F /PID %p >nul 2>&1
 for /f "tokens=5" %p in ('netstat -ano ^| findstr ":8001" ^| findstr "LISTENING"') do taskkill /F /PID %p >nul 2>&1
