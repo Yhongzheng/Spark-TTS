@@ -74,9 +74,105 @@ from pydantic import BaseModel, Field
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from text_frontend.normalizer import TextNormalizer
+import re
 import logging
 
 logger = logging.getLogger("sparktts.app")
+
+import re
+
+# -------- 预编译模式（保护区 + 识别数学/自然语言） --------
+_RE_CODE_FENCE = re.compile(r"```.*?```", re.DOTALL)     # fenced code
+_RE_CODE_INLINE = re.compile(r"`[^`]*`")                 # inline code
+_RE_MATH_INLINE = re.compile(r"\$(?:\\.|[^$])+\$")       # $...$ latex
+
+# URL / 域名 / 协议
+_RE_URL = re.compile(r"\b[a-z]+://[^\s]+", re.IGNORECASE)
+_RE_WWW = re.compile(r"\bwww\.[^\s]+", re.IGNORECASE)
+
+# 路径/盘符/相对路径
+_RE_WIN_DRIVE = re.compile(r"\b[A-Za-z]:/[^\s]+")
+_RE_UNIX_PATH = re.compile(r"(?<!\w)/(?:[^/\s]+/)*[^/\s]+")  # 朴素
+_RE_REL_PATH = re.compile(r"\b[\w.\-]+/(?:[\w.\-]+/)*[\w.\-]+")
+
+# 日期
+_RE_DATE = re.compile(r"\b\d{4}/\d{1,2}/\d{1,2}\b")
+
+# 正则字面量 /pattern/flags
+_RE_REGEX = re.compile(r"(?<!\w)/(?:\\.|[^/])+/[a-z]*", re.IGNORECASE)
+
+# 单位与版本（可选）
+_UNITS = {"km/h","m/s","MB/s","GB/s","kb/s","mb/s","gb/s","fps"}
+_RE_VER = re.compile(r"\bv\d+/\w+\b", re.IGNORECASE)
+
+# 数学环境：变量或数字两侧的斜杠，含括号表达式
+_RE_MATH_TOKEN = r"(?:\d+(?:\.\d+)?|[a-zA-Z]|\([^()]+\))"
+_RE_MATH_PAIR = re.compile(rf"({_RE_MATH_TOKEN})\s*/\s*({_RE_MATH_TOKEN})")
+
+# 自然语言并列：两侧为 CJK 或“≥2字符英文词”
+_RE_WORD = r"(?:[\u4e00-\u9fff]+|[A-Za-z]{2,})"
+_RE_NATURAL_PAIR = re.compile(rf"({_RE_WORD})\s*/\s*({_RE_WORD})")
+
+def _mask_segments(s: str, patterns):
+    """用占位符暂存被保护段，返回新串与恢复函数。"""
+    slots = []
+    def repl(m):
+        slots.append(m.group(0))
+        return f"@@MASK{len(slots)-1}@@"
+    for pat in patterns:
+        s = pat.sub(repl, s)
+    def unmask(x):
+        for i, val in enumerate(slots):
+            x = x.replace(f"@@MASK{i}@@", val)
+        return x
+    return s, unmask
+
+def smart_read_slash(s: str,
+                     math_as: str = "除以",
+                     natural_as: str = "或",
+                     literal_as: str = "",       # 空串=不改
+                     protect_units: set = _UNITS,
+                     protect_versions: bool = True,
+                     protect_regex: bool = True):
+    # 1) 构造保护模式列表
+    protect_list = [
+        _RE_CODE_FENCE, _RE_CODE_INLINE, _RE_MATH_INLINE,
+        _RE_URL, _RE_WWW, _RE_WIN_DRIVE, _RE_UNIX_PATH, _RE_REL_PATH,
+        _RE_DATE,
+    ]
+    if protect_versions:
+        protect_list.append(_RE_VER)
+    if protect_regex:
+        protect_list.append(_RE_REGEX)
+
+    # 2) 先整体遮罩保护段
+    s_masked, unmask = _mask_segments(s, protect_list)
+
+    # 2.1 单位白名单直接遮罩（逐个替换以免误伤）
+    for u in protect_units:
+        s_masked = s_masked.replace(u, f"@@UNIT_{u}@@")
+
+    # 3) 在剩余文本上按优先级替换
+    # 3.1 数学：A/B -> A 除以 B
+    if math_as:
+        s_masked = _RE_MATH_PAIR.sub(rf"\1 {math_as} \2", s_masked)
+
+    # 3.2 自然语言：词/词 -> 词 或 词
+    if natural_as:
+        s_masked = _RE_NATURAL_PAIR.sub(rf"\1 {natural_as} \2", s_masked)
+
+    # 3.3 兜底：把孤立斜杠读“斜杠”（可选）
+    if literal_as:
+        # 避免把“//”注释类吞掉：先保护双斜杠
+        s_masked = s_masked.replace("//", "@@D_SLASH@@")
+        s_masked = s_masked.replace("/", literal_as)
+        s_masked = s_masked.replace("@@D_SLASH@@", "//")  # 也可还原为“//”
+
+    # 4) 恢复单位与保护段
+    for u in protect_units:
+        s_masked = s_masked.replace(f"@@UNIT_{u}@@", u)
+
+    return unmask(s_masked)
 
 
 # ======================== 配置区域（可用环境变量覆盖） ========================
@@ -140,6 +236,11 @@ def pick_device_arg() -> List[str]:
         print(f"[WARN] CUDA 检测失败：{e!r}，将使用 CPU。")
     return []
 
+def _strip_or_extract_pinyin_tags(text: str) -> str:
+    # 暂时：去掉 {词|拼音} 保留“词”本体。
+    # 若后端升级支持拼音，这里改成解析并传给新接口即可。
+    import re
+    return re.sub(r"\{([^|{}]+)\|[^{}]+\}", r"\1", text)
 
 def build_cli_argv(
     *,
@@ -159,6 +260,8 @@ def build_cli_argv(
     - 注意：CLI 仍使用 --model_dir 参数名（Spark-TTS 的接口定义），
       虽然在服务内部变量名用的是 model_path。
     """
+    text = _strip_or_extract_pinyin_tags(text)
+
     argv = [
         sys.executable, "-m", "cli.inference",
         "--text", text,
@@ -477,6 +580,7 @@ def synthesize(req: SynthesisRequest, x_api_key: Optional[str] = Header(default=
         name = f"text_{i:03d}"
         use_norm = item.normalize if item.normalize is not None else req.normalize_text
         text = norm.normalize(item.text) if use_norm else item.text
+        text = smart_read_slash(text)  # 对于 / 的不同情景发音的设置
         argv = build_cli_argv(
             text=text,
             model_path=model_p,
@@ -576,6 +680,7 @@ async def synthesize_txt(
     jobs: List[Tuple[List[str], Path, str]] = []
     for name, text in tasks:
         txt = norm.normalize(text) if normalize_text else text
+        txt = smart_read_slash(txt)  # 对于 / 的不同情景发音的设置
         argv = build_cli_argv(
             text=txt,
             model_path=model_p,

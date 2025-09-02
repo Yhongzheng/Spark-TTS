@@ -23,7 +23,7 @@ def pick_device_arg():
     return []
 
 def main() -> None:
-    text = "你好，这是 Spark-TTS 在 PyCharm 的无参考音色生成测试。"
+    text = "4. 建模选择。20250829结果：梯度提升树（XGBoost、LightGBM、CatBoost）：在 tabular 数据上通常比随机森林更强。时序模型（RNN/LSTM/Transformer）："
 
     repo_root = Path(__file__).resolve().parent
     model_dir = repo_root / "pretrained_models" / "Spark-TTS-0.5B"

@@ -14,3 +14,14 @@ force_zh:
 pinyin_override:
   "重阳": "chong2 yang2"
   "重庆": "chong2 qing4"
+  "建模": "jian4 mo2"
+
+read_slash:
+  enabled: true               # 总开关
+  math_as: "除以"              # 数学环境读法
+  natural_as: "或"             # 自然语言并列读法
+  literal_as: "斜杠"           # 其它情况的兜底读法；设为空字符串表示不改
+  protect_units: ["km/h","m/s","fps","MB/s","GB/s"]  # 单位白名单（可扩展）
+  protect_versions: true      # 保护 v1/rc1 这类
+  protect_regex: true         # 保护 /.../flags
+

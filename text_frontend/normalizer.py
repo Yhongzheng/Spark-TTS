@@ -161,6 +161,18 @@ class TextNormalizer:
                 s = s.replace(k, v)
         return s
 
+    def _apply_pinyin_override(self, s: str) -> str:
+        # 约定：把命中的词替换为 {原词|拼音} 这种“可解析标签”
+        # 例如：建模 -> {建模|jian4 mo2}
+        # 若下游不识别拼音标签，兜底：退回到 force_zh 同义改写（若配置了）。
+        for k, py in self.lex.pinyin_override.items():
+            if not k:
+                continue
+            tagged = f"{{{k}|{py}}}"
+            if k in s:
+                s = s.replace(k, tagged)
+        return s
+
     # -------- 主流程 --------
     def set_english_mode(self, mode: Literal["keep", "spell", "auto"]) -> None:
         self.english_mode = mode
@@ -171,6 +183,7 @@ class TextNormalizer:
         # 0) 保护英文/白名单；再做一次覆盖（中文/符号串）
         s = self._protect_tokens(s)
         s = self._apply_force_zh(s)
+        s = self._apply_pinyin_override(s)
 
         # 1) 年月日 & 时间
         s = self.rules["year"].sub(lambda m: digits_spell_out(m.group(1)), s)  # 年份逐字：二零二五
